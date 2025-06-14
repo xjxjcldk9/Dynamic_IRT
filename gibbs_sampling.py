@@ -1,12 +1,8 @@
 import numpy as np
-from typing import NamedTuple
 from scipy.special import expit
 from scipy.stats import norm, binom
-
-
-class NormalPrior(NamedTuple):
-    mu: float
-    sigma2: float
+import configparser
+import argparse
 
 
 
@@ -16,16 +12,16 @@ class NormalSampler:
         self.sigma2 = sigma2
     def __mul__(self, other):
         if isinstance(other, NormalSampler):
-            post_mu = (self.mu * other.sigma2 + self.sigma2 * other.mu) / (self.sigma2 + other.sigma2)
-            post_sigma2 = self.sigma2 * other.sigma2 / (self.sigma2 + other.sigma2)
-            return NormalSampler(post_mu, post_sigma2)
+            mu = np.array([self.mu, other.mu])
+            sigma2 = np.array([self.sigma2, other.sigma2])
+            return NormalSampler(mu, sigma2).colapse()
     
     def colapse(self):
         """
         如果mu, sigma2 是多維，這邊可以做乘法
         """
         sigma2 = 1 / (1 / self.sigma2).sum()
-        loc = (self.mu / self.sigma2).sum() / sigma2
+        loc = (self.mu / self.sigma2).sum() * sigma2
         return NormalSampler(loc, sigma2)
         
 
@@ -46,12 +42,10 @@ class Model3Exp:
     def generate_data(self, N, T):
         
         z = np.zeros((N,T))
-        
         z[:,0] = np.random.normal(size=N)
         
         d = np.zeros((N,T))
         d[:,0] = np.random.normal(size=N)
-        
         
         for t in range(1, T):
             d[:, t] = z[:, t-1] + np.random.normal(size=N)
@@ -66,69 +60,104 @@ class Model3Exp:
         self.N = N
         self.T = T
     
-    def run_gibbs_sampling(self, B, alpha_prior: NormalPrior, beta_prior: NormalPrior):
+    def run_gibbs_sampling(self, B, alpha_prior: NormalSampler, beta_prior: NormalSampler):
         alpha_sampling = np.zeros(B+1)
-        alpha_sampling[0] = NormalSampler(**alpha_prior).sample(1)
+        alpha_sampling[0] = alpha_prior.sample(1)[0]
         
         beta_sampling = np.zeros(B+1)
-        beta_sampling[0] = NormalSampler(**beta_prior).sample(1)
+        beta_sampling[0] = beta_prior.sample(1)[0]
+        
+
+        #initialize cheating
+        self.z_sampling = self.z
         
         for b in range(B):
-            z_sampling = self._z_gibbs_sample(alpha_sampling[b])
-            alpha_sampling[b+1] = self._alpha_gibbs_sample(beta_sampling[b], z_sampling, alpha_prior)
-            beta_sampling[b+1] = self._beta_gibbs_sample(alpha_sampling[b+1], z_sampling, beta_prior)
+            self.z_sampling = self._z_gibbs_sample(alpha_sampling[b], beta_sampling[b])
+            alpha_sampling[b+1] = self._alpha_gibbs_sample(beta_sampling[b], self.z_sampling, alpha_prior)
+            beta_sampling[b+1] = self._beta_gibbs_sample(alpha_sampling[b+1], self.z_sampling, beta_prior)
         
         self.alpha_sampling = alpha_sampling[1:]
         self.beta_sampling = beta_sampling[1:]
     
-    def _alpha_gibbs_sample(self, beta, z, alpha_prior: NormalPrior):
-        likelihood_mu = (-beta * np.exp(-(self.d[:,1:]-z[:,:-1])**2) - z[:,:-1] + z[:,1:]).sum()
-        likelihood = NormalPrior(likelihood_mu, self.sigma2 / (self.T-1) / self.N)
-        sampler = NormalSampler(alpha_prior.mu, alpha_prior.sigma2)  * likelihood
-        return sampler.sample(1)
+    def _alpha_gibbs_sample(self, beta, z, alpha_prior: NormalSampler):
+        likelihood_mu = z[:, 1:] - z[:, :-1] - beta * np.exp(-(self.d[:,1:]-z[:,:-1])**2)
+        
+        likelihood = NormalSampler(likelihood_mu, np.ones_like(likelihood_mu) * self.sigma2).colapse()
     
-    def _beta_gibbs_sample(self, alpha, z, beta_prior):
+        sampler = alpha_prior * likelihood
         
-        multiplier = np.exp((self.d[:,1:]-z[:,:-1])**2)
+        return sampler.sample(1)[0]
+    
+    def _beta_gibbs_sample(self, alpha, z, beta_prior: NormalSampler):
         
-        likelihood_mu = -(alpha+z[:,:-1]-z[:,1:]) * multiplier
-        sigma2 = self.sigma2 * multiplier**2
+        multiplier = np.exp(-(self.d[:,1:]-z[:,:-1])**2)
+        
+        likelihood_mu = (z[:, 1:] - z[:, :-1] - alpha) / multiplier
+        sigma2 = self.sigma2 / multiplier**2
         
         likelihood = NormalSampler(likelihood_mu, sigma2).colapse()
-        sampler = NormalSampler(beta_prior.mu, beta_prior.sigma2)  * likelihood
-        return sampler.sample(1)
+        
+        sampler = beta_prior * likelihood
+    
+        return sampler.sample(1)[0]
     
     def _z_gibbs_sample(self, alpha, beta):
         z = np.zeros((self.N, self.T))
         z[:,0] = np.random.normal(size=self.N)
         
         for t in range(1, self.T):
-            z[:,t] = self._z_mh_sampling(alpha, beta, self.d[:, t] , z[:, t-1], self.y[:, t])
+            z[:,t] = self._z_mh_sampling(alpha, beta, self.d[:, t] , z[:, t-1], self.y[:, t], self.z_sampling[:,t])
+        
         return z
-            
-            
-    def _z_mh_sampling(self, alpha, beta, d, z_prev, y):
-        base_loc = z_prev+alpha+beta+np.exp(-(d-z_prev)**2)
+                
+    def _z_mh_sampling(self, alpha, beta, d, z_t_1, y, z_prev):
+        
+        
+        base_loc = z_t_1 + alpha + beta*np.exp(-(d-z_t_1)**2)
         base_sig = np.sqrt(self.sigma2)
         
         def norm_pdf(x):
             return norm.pdf(x, loc=base_loc, scale=base_sig)
         
         def pdf(x):
-            return norm_pdf * binom.pmf(y, 1, expit(x-d))
+            return norm_pdf(x) * binom.pmf(y, 1, expit(x-d))
             
-        y = norm.rvs(loc=base_loc, scale=base_sig)
-            
-        mh = pdf(y) * norm_pdf(z_prev) / pdf(z_prev) / norm_pdf(y)
-        probs = np.minimum(mh, 1)
-        result = np.where(np.random.rand() < probs, z_prev, y)
+        z = norm.rvs(loc=base_loc, scale=base_sig)
+        
+        mh = pdf(z) * norm_pdf(z_prev) / pdf(z_prev) / norm_pdf(z)
+        prob = np.minimum(mh, 1)
+        
+        result = np.where(np.random.rand(self.N) < prob, z, z_prev)
+        
         return result
-
-
-
 
        
 if __name__ == '__main__':
-    model = Model3Exp(1,2,1)
-    model.generate_data(100,20)
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--param', default='DEFAULT')
+    args = parser.parse_args()
+    
+    config = configparser.ConfigParser()
+    config.read('param.ini')
+    param_config = config[args.param]
+    
+    alpha = param_config.getfloat('alpha')
+    beta = param_config.getfloat('beta')
+    sigma2 = param_config.getfloat('sigma2')
+    
+    model = Model3Exp(alpha, beta, sigma2)
+    N = param_config.getint('N')
+    T = param_config.getint('T')
+    
+    model.generate_data(N, T)
+    
+    
+    B = param_config.getint('B')
+    alpha_prior = NormalSampler(param_config.getfloat('alpha_prior_mu'), param_config.getfloat('alpha_prior_sigma2'))
+    beta_prior = NormalSampler(param_config.getfloat('beta_prior_mu'), param_config.getfloat('beta_prior_sigma2'))
+    model.run_gibbs_sampling(B, alpha_prior, beta_prior)
+    
+    print(f'true alpha: {alpha};  post mean: {model.alpha_sampling.mean()}, var: {model.alpha_sampling.var()}' )
+    print(f'true beta: {beta};  post mean: {model.beta_sampling.mean()}, var: {model.beta_sampling.var()}' )
     breakpoint()
+    
