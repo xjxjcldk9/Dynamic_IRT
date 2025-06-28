@@ -72,7 +72,8 @@ class Model3Exp:
         self.z_sampling = self.z
         
         for b in range(B):
-            self.z_sampling = self._z_gibbs_sample(alpha_sampling[b], beta_sampling[b])
+            self.z_sampling = self._z_gibbs_sample(alpha_sampling[b], beta_sampling[b])        
+            self.OLS_checker()
             alpha_sampling[b+1] = self._alpha_gibbs_sample(beta_sampling[b], self.z_sampling, alpha_prior)
             beta_sampling[b+1] = self._beta_gibbs_sample(alpha_sampling[b+1], self.z_sampling, beta_prior)
         
@@ -130,6 +131,17 @@ class Model3Exp:
         result = np.where(np.random.rand(self.N) < prob, z, z_prev)
         
         return result
+    
+    def OLS_checker(self):
+       X = (np.exp(-(self.d[:,1:] - self.z_sampling[:,:-1])**2)).reshape((-1,1))
+       y = (self.z_sampling[:,1:] - self.z_sampling[:,:-1]).reshape(-1)
+       
+       ones = np.ones((X.shape[0], 1))
+       X = np.hstack((ones, X))
+    
+       result, _, _, _ = np.linalg.lstsq(X, y)
+       print(result)
+       
 
        
 if __name__ == '__main__':
